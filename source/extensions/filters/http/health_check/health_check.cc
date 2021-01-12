@@ -104,7 +104,12 @@ Http::FilterHeadersStatus HealthCheckFilter::encodeHeaders(Http::ResponseHeaderM
     }
 
     headers.setEnvoyUpstreamHealthCheckedCluster(context_.localInfo().clusterName());
-  } else if (context_.healthCheckFailed()) {
+  }
+
+  if (context_.healthCheckFailed() &&
+      Runtime::runtimeFeatureEnabled(
+          "envoy.reloadable_features.health_check.immediate_failure_exclude_from_cluster")) {
+    // fixfix runtime test.
     headers.setReferenceEnvoyImmediateHealthCheckFail(
         Http::Headers::get().EnvoyImmediateHealthCheckFailValues.True);
   }

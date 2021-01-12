@@ -229,7 +229,7 @@ TEST_F(HealthCheckFilterNoPassThroughTest, ComputedHealth) {
 }
 
 TEST_F(HealthCheckFilterNoPassThroughTest, HealthCheckFailedCallbackCalled) {
-  EXPECT_CALL(context_, healthCheckFailed()).WillOnce(Return(true));
+  EXPECT_CALL(context_, healthCheckFailed()).Times(2).WillRepeatedly(Return(true));
   EXPECT_CALL(callbacks_.stream_info_, healthCheck(true));
   EXPECT_CALL(callbacks_.active_span_, setSampled(false));
   Http::TestResponseHeaderMapImpl health_check_response{{":status", "503"}};
@@ -238,7 +238,7 @@ TEST_F(HealthCheckFilterNoPassThroughTest, HealthCheckFailedCallbackCalled) {
       .WillRepeatedly(Invoke([&](Http::ResponseHeaderMap& headers, bool end_stream) {
         filter_->encodeHeaders(headers, end_stream);
         EXPECT_EQ("cluster_name", headers.getEnvoyUpstreamHealthCheckedClusterValue());
-        EXPECT_EQ(nullptr, headers.EnvoyImmediateHealthCheckFail());
+        EXPECT_NE(nullptr, headers.EnvoyImmediateHealthCheckFail());
       }));
 
   EXPECT_CALL(callbacks_.stream_info_,
@@ -253,7 +253,7 @@ TEST_F(HealthCheckFilterNoPassThroughTest, HealthCheckFailedCallbackCalled) {
 }
 
 TEST_F(HealthCheckFilterPassThroughTest, Ok) {
-  EXPECT_CALL(context_, healthCheckFailed()).WillOnce(Return(false));
+  EXPECT_CALL(context_, healthCheckFailed()).Times(2).WillRepeatedly(Return(false));
   EXPECT_CALL(callbacks_.stream_info_, healthCheck(true));
   EXPECT_CALL(callbacks_.active_span_, setSampled(false));
   EXPECT_CALL(callbacks_, encodeHeaders_(_, _)).Times(0);
@@ -265,7 +265,7 @@ TEST_F(HealthCheckFilterPassThroughTest, Ok) {
 }
 
 TEST_F(HealthCheckFilterPassThroughTest, OkWithContinue) {
-  EXPECT_CALL(context_, healthCheckFailed()).WillOnce(Return(false));
+  EXPECT_CALL(context_, healthCheckFailed()).Times(2).WillRepeatedly(Return(false));
   EXPECT_CALL(callbacks_.stream_info_, healthCheck(true));
   EXPECT_CALL(callbacks_.active_span_, setSampled(false));
   EXPECT_CALL(callbacks_, encodeHeaders_(_, _)).Times(0);
