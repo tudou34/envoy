@@ -77,7 +77,7 @@ public:
    */
   virtual void limit(RequestCallbacks& callbacks, const std::string& domain,
                      const std::vector<Envoy::RateLimit::Descriptor>& descriptors,
-                     Tracing::Span& parent_span) PURE;
+                     Tracing::Span& parent_span, uint32_t hits) PURE;
 };
 
 using ClientPtr = std::unique_ptr<Client>;
