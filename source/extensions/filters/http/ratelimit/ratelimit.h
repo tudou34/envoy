@@ -168,6 +168,7 @@ private:
   VhRateLimitOptions vh_rate_limits_;
   Upstream::ClusterInfoConstSharedPtr cluster_;
   bool initiating_call_{};
+  std::string rl_key_;
   Http::ResponseHeaderMapPtr response_headers_to_add_;
   Http::RequestHeaderMap* request_headers_{};
 };

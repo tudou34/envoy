@@ -2,6 +2,9 @@
 
 #include <string>
 #include <vector>
+#include <map>
+#include <mutex>
+#include <iostream>
 
 #include "envoy/http/codes.h"
 
@@ -27,6 +30,58 @@ struct RcDetailsValues {
   const std::string RateLimitError = "rate_limiter_error";
 };
 using RcDetails = ConstSingleton<RcDetailsValues>;
+
+const uint32_t threshold = 5;
+struct rlStatistic {
+  uint32_t hits;
+  Filters::Common::RateLimit::LimitStatus lastStatus;
+};
+
+std::map<std::string, rlStatistic*> g_hits;
+std::mutex g_hits_mutex;
+
+std::string generateCacheKey(const std::string& domain,
+                             const std::vector<Envoy::RateLimit::Descriptor>& descriptors) {
+  std::string key = domain;
+  for (auto descriptor : descriptors) {
+    for (auto entry : descriptor.entries_) {
+      key += "_" + entry.key_ + "_" + entry.value_;
+    }
+  }
+  return key;
+}
+
+std::ostream& operator<<(std::ostream& os, const Filters::Common::RateLimit::LimitStatus& obj) {
+  os << static_cast<std::underlying_type<Filters::Common::RateLimit::LimitStatus>::type>(obj);
+  return os;
+}
+
+void setLastStatus(const std::string& key, Filters::Common::RateLimit::LimitStatus status) {
+  auto it = g_hits.find(key);
+  if (it == g_hits.end()) {
+    return;
+  }
+  it->second->lastStatus = status;
+}
+
+bool isNeedCheckLimit(const std::string& key, Filters::Common::RateLimit::LimitStatus& status) {
+  std::lock_guard<std::mutex> guard(g_hits_mutex);
+  auto it = g_hits.find(key);
+  if (it == g_hits.end()) {
+    rlStatistic* rs = new rlStatistic{1, Filters::Common::RateLimit::LimitStatus::OK};
+    g_hits.insert(std::make_pair(key, rs));
+    status = Filters::Common::RateLimit::LimitStatus::OK;
+    return true;
+  } else if (it->second->hits < threshold) {
+    it->second->hits++;
+    status = it->second->lastStatus;
+  } else {
+    it->second->hits = 1;
+    return true;
+  }
+
+  return false;
+}
 
 void Filter::initiateCall(const Http::RequestHeaderMap& headers) {
   const bool is_internal_request = Http::HeaderUtility::isEnvoyInternalRequest(headers);
@@ -72,11 +127,22 @@ void Filter::initiateCall(const Http::RequestHeaderMap& headers) {
 
   if (!descriptors.empty()) {
     state_ = State::Calling;
+
+    rl_key_ = generateCacheKey(config_->domain(), descriptors);
+    Filters::Common::RateLimit::LimitStatus status;
+    bool execLimit = isNeedCheckLimit(rl_key_, status);
+    // std::cout << status << execLimit << std::endl;
+    if (execLimit == false) {
+      initiating_call_ = true;
+      complete(status, nullptr, nullptr, nullptr);
+      return;
+    }
+
     initiating_call_ = true;
-    client_->limit(*this, config_->domain(), descriptors, callbacks_->activeSpan());
+    client_->limit(*this, config_->domain(), descriptors, callbacks_->activeSpan(), threshold);
     initiating_call_ = false;
   }
-}
+} // namespace RateLimitFilter
 
 Http::FilterHeadersStatus Filter::decodeHeaders(Http::RequestHeaderMap& headers, bool) {
   if (!config_->runtime().snapshot().featureEnabled("ratelimit.http_filter_enabled", 100)) {
@@ -143,6 +209,8 @@ void Filter::complete(Filters::Common::RateLimit::LimitStatus status,
                       Filters::Common::RateLimit::DescriptorStatusListPtr&& descriptor_statuses,
                       Http::ResponseHeaderMapPtr&& response_headers_to_add,
                       Http::RequestHeaderMapPtr&& request_headers_to_add) {
+  setLastStatus(rl_key_, status);
+
   state_ = State::Complete;
   response_headers_to_add_ = std::move(response_headers_to_add);
   Http::HeaderMapPtr req_headers_to_add = std::move(request_headers_to_add);
