@@ -119,6 +119,7 @@ function bazel_binary_build() {
   bazel build "${BAZEL_BUILD_OPTIONS[@]}" -c "${COMPILE_TYPE}" "${ENVOY_BUILD_TARGET}" ${CONFIG_ARGS}
   collect_build_profile "${BINARY_TYPE}"_build
 
+  echo "Build end, do copy..."
   # Copy the built envoy binary somewhere that we can access outside of the
   # container.
   cp_binary_for_outside_access envoy

@@ -17,6 +17,8 @@
 #include "common/runtime/runtime_protos.h"
 #include "common/upstream/edf_scheduler.h"
 
+#include "absl/container/btree_set.h"
+
 namespace Envoy {
 namespace Upstream {
 
@@ -367,12 +369,14 @@ private:
  * This base class also supports unweighted selection which derived classes can use to customize
  * behavior. Derived classes can also override how host weight is determined when in weighted mode.
  */
-class EdfLoadBalancerBase : public ZoneAwareLoadBalancerBase {
+class EdfLoadBalancerBase : public ZoneAwareLoadBalancerBase,
+                            Logger::Loggable<Logger::Id::upstream> {
 public:
   EdfLoadBalancerBase(const PrioritySet& priority_set, const PrioritySet* local_priority_set,
                       ClusterStats& stats, Runtime::Loader& runtime,
                       Random::RandomGenerator& random,
-                      const envoy::config::cluster::v3::Cluster::CommonLbConfig& common_config);
+                      const envoy::config::cluster::v3::Cluster::CommonLbConfig& common_config,
+                      TimeSource& time_source);
 
   // Upstream::LoadBalancerBase
   HostConstSharedPtr peekAnotherHost(LoadBalancerContext* context) override;
@@ -389,6 +393,11 @@ protected:
   void initialize();
 
   virtual void refresh(uint32_t priority);
+
+  bool noHostsAreInSlowStart();
+
+  virtual void recalculateHostsInSlowStart(const HostVector& hosts_added,
+                                           const HostVector& hosts_removed);
 
   // Seed to allow us to desynchronize load balancers across a fleet. If we don't
   // do this, multiple Envoys that receive an update at the same time (or even
@@ -407,6 +416,21 @@ private:
 
   // Scheduler for each valid HostsSource.
   absl::node_hash_map<HostsSource, Scheduler, HostsSourceHash> scheduler_;
+
+  // Slow start related configs
+  const envoy::config::cluster::v3::Cluster::CommonLbConfig::EndpointWarmingPolicy
+      endpoint_warming_policy;
+  const std::chrono::milliseconds slow_start_window;
+  double time_bias_{};
+  const std::unique_ptr<Runtime::Double> time_bias_runtime_;
+  TimeSource& time_source_;
+  struct orderByCreateDateDesc {
+    bool operator()(const HostSharedPtr l, const HostSharedPtr r) const {
+      return l->creationTime() < r->creationTime();
+    }
+  };
+  absl::btree_multiset<HostSharedPtr, orderByCreateDateDesc> hosts_in_slow_start_;
+  friend class EdfLoadBalancerBasePeer;
 };
 
 /**
@@ -418,9 +442,10 @@ public:
   RoundRobinLoadBalancer(const PrioritySet& priority_set, const PrioritySet* local_priority_set,
                          ClusterStats& stats, Runtime::Loader& runtime,
                          Random::RandomGenerator& random,
-                         const envoy::config::cluster::v3::Cluster::CommonLbConfig& common_config)
-      : EdfLoadBalancerBase(priority_set, local_priority_set, stats, runtime, random,
-                            common_config) {
+                         const envoy::config::cluster::v3::Cluster::CommonLbConfig& common_config,
+                         TimeSource& time_source)
+      : EdfLoadBalancerBase(priority_set, local_priority_set, stats, runtime, random, common_config,
+                            time_source) {
     initialize();
   }
 
@@ -485,9 +510,10 @@ public:
       Runtime::Loader& runtime, Random::RandomGenerator& random,
       const envoy::config::cluster::v3::Cluster::CommonLbConfig& common_config,
       const absl::optional<envoy::config::cluster::v3::Cluster::LeastRequestLbConfig>
-          least_request_config)
-      : EdfLoadBalancerBase(priority_set, local_priority_set, stats, runtime, random,
-                            common_config),
+          least_request_config,
+      TimeSource& time_source)
+      : EdfLoadBalancerBase(priority_set, local_priority_set, stats, runtime, random, common_config,
+                            time_source),
         choice_count_(
             least_request_config.has_value()
                 ? PROTOBUF_GET_WRAPPED_OR_DEFAULT(least_request_config.value(), choice_count, 2)
@@ -563,13 +589,19 @@ private:
 /**
  * Random load balancer that picks a random host out of all hosts.
  */
-class RandomLoadBalancer : public ZoneAwareLoadBalancerBase {
+class RandomLoadBalancer : public ZoneAwareLoadBalancerBase,
+                           Logger::Loggable<Logger::Id::upstream> {
 public:
   RandomLoadBalancer(const PrioritySet& priority_set, const PrioritySet* local_priority_set,
                      ClusterStats& stats, Runtime::Loader& runtime, Random::RandomGenerator& random,
                      const envoy::config::cluster::v3::Cluster::CommonLbConfig& common_config)
       : ZoneAwareLoadBalancerBase(priority_set, local_priority_set, stats, runtime, random,
-                                  common_config) {}
+                                  common_config) {
+    if (common_config.has_slow_start_config()) {
+      // TODO(nezdolik) maybe use error status
+      ENVOY_LOG(warn, "Slow start mode is not supported for random lb");
+    }
+  }
 
   // Upstream::LoadBalancerBase
   HostConstSharedPtr chooseHostOnce(LoadBalancerContext* context) override;

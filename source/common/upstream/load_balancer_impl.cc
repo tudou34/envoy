@@ -4,6 +4,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <iostream>
 
 #include "envoy/config/cluster/v3/cluster.pb.h"
 #include "envoy/runtime/runtime.h"
@@ -693,17 +694,48 @@ const HostVector& ZoneAwareLoadBalancerBase::hostSourceToHosts(HostsSource hosts
 EdfLoadBalancerBase::EdfLoadBalancerBase(
     const PrioritySet& priority_set, const PrioritySet* local_priority_set, ClusterStats& stats,
     Runtime::Loader& runtime, Random::RandomGenerator& random,
-    const envoy::config::cluster::v3::Cluster::CommonLbConfig& common_config)
+    const envoy::config::cluster::v3::Cluster::CommonLbConfig& common_config,
+    TimeSource& time_source)
     : ZoneAwareLoadBalancerBase(priority_set, local_priority_set, stats, runtime, random,
                                 common_config),
-      seed_(random_.random()) {
+      seed_(random_.random()),
+      endpoint_warming_policy(common_config.has_slow_start_config()
+                                  ? common_config.slow_start_config().endpoint_warming_policy()
+                                  : envoy::config::cluster::v3::Cluster::CommonLbConfig::NO_WAIT),
+      // slow_start_window(std::chrono::milliseconds(
+      //                       common_config.has_slow_start_config()
+      //                           ?
+      //                           PROTOBUF_GET_WRAPPED_OR_DEFAULT(common_config.slow_start_config(),
+      //                                                             slow_start_window, 0)
+      //                           : 0) *
+      //                   1000),
+      // time_bias_runtime_(
+      //     common_config.has_slow_start_config() &&
+      //     common_config.slow_start_config().has_time_bias()
+      //         ? std::make_unique<Runtime::Double>(common_config.slow_start_config().time_bias(),
+      //                                             runtime)
+      //         : nullptr),
+      slow_start_window(std::chrono::milliseconds(10) * 1000),
+      // time_bias_runtime_(std::make_unique<Runtime::Double>(0.3,runtime),
+      time_source_(time_source) {
+  auto ddd = new (envoy::config::core::v3::RuntimeDouble);
+  ddd->set_default_value(0.3);
+  ddd->set_runtime_key("xxx");
+  time_bias_runtime_ = (std::make_unique<Runtime::Double>(*ddd,runtime),
   // We fully recompute the schedulers for a given host set here on membership change, which is
   // consistent with what other LB implementations do (e.g. thread aware).
   // The downside of a full recompute is that time complexity is O(n * log n),
   // so we will need to do better at delta tracking to scale (see
   // https://github.com/envoyproxy/envoy/issues/2874).
   priority_set.addPriorityUpdateCb(
-      [this](uint32_t priority, const HostVector&, const HostVector&) { refresh(priority); });
+      [this](uint32_t priority, const HostVector& hosts_added, const HostVector& hosts_removed) {
+    recalculateHostsInSlowStart(hosts_added, hosts_removed);
+    refresh(priority);
+      });
+  priority_set.addMemberUpdateCb(
+      [this](const HostVector& hosts_added, const HostVector& hosts_removed) -> void {
+    recalculateHostsInSlowStart(hosts_added, hosts_removed);
+      });
 }
 
 void EdfLoadBalancerBase::initialize() {
@@ -712,16 +744,58 @@ void EdfLoadBalancerBase::initialize() {
   }
 }
 
+void EdfLoadBalancerBase::recalculateHostsInSlowStart(const HostVector& hosts_added,
+                                                      const HostVector& hosts_removed) {
+  for (const auto& host : hosts_added) {
+    auto host_create_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+        time_source_.monotonicTime() - host->creationTime());
+    // Check if host existence time is within slow start window.
+    if (host_create_duration <= slow_start_window) {
+      // If it is, then we need to verify that hosts adheres to endpoint warming policy.
+      switch (endpoint_warming_policy) {
+      case envoy::config::cluster::v3::Cluster::CommonLbConfig::NO_WAIT:
+        // Host enters slow start immediately
+        hosts_in_slow_start_.insert(host);
+        break;
+      case envoy::config::cluster::v3::Cluster::CommonLbConfig::WAIT_FOR_FIRST_PASSING_HC:
+        // Check health status of host. It should be marked as healthy and have first passed
+        // healthcheck. TODO(nezdolik) is this equivalent to "host has passed first HC" ?
+        if (host->health() == Upstream::Host::Health::Healthy &&
+            !host->healthFlagGet(Host::HealthFlag::PENDING_ACTIVE_HC)) {
+          hosts_in_slow_start_.insert(host);
+        }
+        break;
+      default:
+        NOT_REACHED_GCOVR_EXCL_LINE;
+      }
+    } else if (hosts_in_slow_start_.find(host) != hosts_in_slow_start_.end()) {
+      // Removes all hosts with same creation date, which are outside of slow start window.
+      hosts_in_slow_start_.erase(host);
+    }
+  }
+  // Compact hosts_in_slow_start_, erase hosts that are outside of slow start window.
+  auto current_time =
+      std::chrono::time_point_cast<std::chrono::milliseconds>(time_source_.monotonicTime());
+
+  while (!hosts_in_slow_start_.empty() &&
+         (current_time - (std::chrono::time_point_cast<std::chrono::milliseconds>(
+                             (*(--hosts_in_slow_start_.end()))->creationTime())) >
+          slow_start_window)) {
+    hosts_in_slow_start_.erase(--hosts_in_slow_start_.end());
+  }
+}
+
 void EdfLoadBalancerBase::refresh(uint32_t priority) {
-  const auto add_hosts_source = [this](HostsSource source, const HostVector& hosts) {
+  const auto add_hosts_source = [this, priority](HostsSource source, const HostVector& hosts) {
     // Nuke existing scheduler if it exists.
     auto& scheduler = scheduler_[source] = Scheduler{};
     refreshHostSource(source);
 
-    // Check if the original host weights are equal and skip EDF creation if they are. When all
-    // original weights are equal we can rely on unweighted host pick to do optimal round robin and
-    // least-loaded host selection with lower memory and CPU overhead.
-    if (hostWeightsAreEqual(hosts)) {
+    // Check if the original host weights are equal and no hosts are in slow start mode, in that
+    // case EDF creation is skipped. When all original weights are equal and no hosts are in slow
+    // start mode we can rely on unweighted host pick to do optimal round robin and least-loaded
+    // host selection with lower memory and CPU overhead.
+    if (hostWeightsAreEqual(hosts) && noHostsAreInSlowStart()) {
       // Skip edf creation.
       return;
     }
@@ -734,11 +808,27 @@ void EdfLoadBalancerBase::refresh(uint32_t priority) {
     // We should probably change this to refresh at all times. See the comment in
     // BaseDynamicClusterImpl::updateDynamicHostList about this.
     for (const auto& host : hosts) {
+      auto host_weight = hostWeight(*host);
+      auto host_create_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+          time_source_.monotonicTime() - host->creationTime());
+      if (host_create_duration <= slow_start_window) {
+        time_bias_ = time_bias_runtime_ != nullptr ? time_bias_runtime_->value() : 1.0;
+
+        if (time_bias_ < 0.0) {
+          ENVOY_LOG(warn, "upstream: invalid time bias supplied (runtime key {}), using 1.0",
+                    time_bias_runtime_->runtimeKey());
+          time_bias_ = 1.0;
+        }
+        host_weight *= time_bias_;
+        std::cout << "priority: " << priority << ",host: " << host->hostname()
+                  << ",weight: " << host_weight << std::endl;
+      }
+
       // We use a fixed weight here. While the weight may change without
       // notification, this will only be stale until this host is next picked,
       // at which point it is reinserted into the EdfScheduler with its new
       // weight in chooseHost().
-      scheduler.edf_->add(hostWeight(*host), host);
+      scheduler.edf_->add(host_weight, host);
     }
 
     // Cycle through hosts to achieve the intended offset behavior.
@@ -773,6 +863,28 @@ void EdfLoadBalancerBase::refresh(uint32_t priority) {
   }
 }
 
+bool EdfLoadBalancerBase::noHostsAreInSlowStart() {
+  if (hosts_in_slow_start_.size() == 0) {
+    return true;
+  } else {
+    auto current_time =
+        std::chrono::time_point_cast<std::chrono::milliseconds>(time_source_.monotonicTime());
+
+    // Check if any host is within slow start window. This condition holds if at least latest
+    // added host is within slow start window.
+    // If all hosts are out of the window, we no longer need to track them and therefore we erase
+    // tracked hosts set.
+    auto latest_host_added_time = std::chrono::time_point_cast<std::chrono::milliseconds>(
+        (*hosts_in_slow_start_.begin())->creationTime());
+    if (current_time - latest_host_added_time > slow_start_window) {
+      hosts_in_slow_start_.erase(hosts_in_slow_start_.begin(), hosts_in_slow_start_.end());
+      return true;
+    } else {
+      return false;
+    }
+  }
+}
+
 HostConstSharedPtr EdfLoadBalancerBase::peekAnotherHost(LoadBalancerContext* context) {
   const absl::optional<HostsSource> hosts_source = hostSourceToUse(context, random(true));
   if (!hosts_source) {
@@ -786,8 +898,8 @@ HostConstSharedPtr EdfLoadBalancerBase::peekAnotherHost(LoadBalancerContext* con
 
   // As has been commented in both EdfLoadBalancerBase::refresh and
   // BaseDynamicClusterImpl::updateDynamicHostList, we must do a runtime pivot here to determine
-  // whether to use EDF or do unweighted (fast) selection. EDF is non-null iff the original weights
-  // of 2 or more hosts differ.
+  // whether to use EDF or do unweighted (fast) selection. EDF is non-null iff the original
+  // weights of 2 or more hosts differ.
   if (scheduler.edf_ != nullptr) {
     return scheduler.edf_->peekAgain([this](const Host& host) { return hostWeight(host); });
   } else {
@@ -812,8 +924,8 @@ HostConstSharedPtr EdfLoadBalancerBase::chooseHostOnce(LoadBalancerContext* cont
 
   // As has been commented in both EdfLoadBalancerBase::refresh and
   // BaseDynamicClusterImpl::updateDynamicHostList, we must do a runtime pivot here to determine
-  // whether to use EDF or do unweighted (fast) selection. EDF is non-null iff the original weights
-  // of 2 or more hosts differ.
+  // whether to use EDF or do unweighted (fast) selection. EDF is non-null iff the original
+  // weights of 2 or more hosts differ.
   if (scheduler.edf_ != nullptr) {
     auto host = scheduler.edf_->pickAndAdd([this](const Host& host) { return hostWeight(host); });
     return host;
@@ -889,7 +1001,6 @@ SubsetSelectorImpl::SubsetSelectorImpl(
     : selector_keys_(selector_keys.begin(), selector_keys.end()), fallback_policy_(fallback_policy),
       fallback_keys_subset_(fallback_keys_subset.begin(), fallback_keys_subset.end()),
       single_host_per_subset_(single_host_per_subset) {
-
   if (fallback_policy_ !=
       envoy::config::cluster::v3::Cluster::LbSubsetConfig::LbSubsetSelector::KEYS_SUBSET) {
     // defining fallback_keys_subset_ for a fallback policy other than KEYS_SUBSET doesn't have
