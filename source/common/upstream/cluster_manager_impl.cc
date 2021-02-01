@@ -7,6 +7,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <iostream>
 
 #include "envoy/admin/v3/config_dump.pb.h"
 #include "envoy/config/bootstrap/v3/bootstrap.pb.h"
@@ -1295,6 +1296,7 @@ ClusterManagerImpl::ThreadLocalClusterManagerImpl::ClusterEntry::ClusterEntry(
                          parent_.parent_.http_context_) {
   priority_set_.getOrCreateHostSet(0);
 
+  std::cout << "ClusterEntry" << std::endl;
   // TODO(mattklein123): Consider converting other LBs over to thread local. All of them could
   // benefit given the healthy panic, locality, and priority calculations that take place.
   if (cluster->lbSubsetInfo().isEnabled()) {
