@@ -721,7 +721,7 @@ EdfLoadBalancerBase::EdfLoadBalancerBase(
   auto ddd = new (envoy::config::core::v3::RuntimeDouble);
   ddd->set_default_value(0.3);
   ddd->set_runtime_key("xxx");
-  time_bias_runtime_ = (std::make_unique<Runtime::Double>(*ddd,runtime),
+  time_bias_runtime_ = std::make_unique<Runtime::Double>(*ddd, runtime);
   // We fully recompute the schedulers for a given host set here on membership change, which is
   // consistent with what other LB implementations do (e.g. thread aware).
   // The downside of a full recompute is that time complexity is O(n * log n),
@@ -729,12 +729,12 @@ EdfLoadBalancerBase::EdfLoadBalancerBase(
   // https://github.com/envoyproxy/envoy/issues/2874).
   priority_set.addPriorityUpdateCb(
       [this](uint32_t priority, const HostVector& hosts_added, const HostVector& hosts_removed) {
-    recalculateHostsInSlowStart(hosts_added, hosts_removed);
-    refresh(priority);
+        recalculateHostsInSlowStart(hosts_added, hosts_removed);
+        refresh(priority);
       });
   priority_set.addMemberUpdateCb(
       [this](const HostVector& hosts_added, const HostVector& hosts_removed) -> void {
-    recalculateHostsInSlowStart(hosts_added, hosts_removed);
+        recalculateHostsInSlowStart(hosts_added, hosts_removed);
       });
 }
 
