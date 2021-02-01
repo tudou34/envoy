@@ -695,6 +695,7 @@ envoy::config::core::v3::RuntimeDouble* newRuntimeDouble() {
   auto ddd = new (envoy::config::core::v3::RuntimeDouble);
   ddd->set_default_value(0.3);
   ddd->set_runtime_key("xxx");
+  return ddd;
 }
 
 EdfLoadBalancerBase::EdfLoadBalancerBase(
@@ -722,7 +723,8 @@ EdfLoadBalancerBase::EdfLoadBalancerBase(
       //                                             runtime)
       //         : nullptr),
       slow_start_window(std::chrono::milliseconds(10) * 1000),
-      time_bias_runtime_(std::make_unique<Runtime::Double>(*std::move(newRuntimeDouble()),runtime),
+      time_bias_runtime_(
+          std::make_unique<Runtime::Double>(*std::move(newRuntimeDouble()), runtime)),
       time_source_(time_source) {
   // We fully recompute the schedulers for a given host set here on membership change, which is
   // consistent with what other LB implementations do (e.g. thread aware).
@@ -734,10 +736,13 @@ EdfLoadBalancerBase::EdfLoadBalancerBase(
         recalculateHostsInSlowStart(hosts_added, hosts_removed);
         refresh(priority);
       });
-  priority_set.addMemberUpdateCb(
-      [this](const HostVector& hosts_added, const HostVector& hosts_removed) -> void {
-        recalculateHostsInSlowStart(hosts_added, hosts_removed);
-      });
+  priority_set.addMemberUpdateCb([this](const HostVector& hosts_added,
+                                        const HostVector& hosts_removed) -> void {
+    recalculateHostsInSlowStart(hosts_added, hosts_removed);
+    for (uint32_t priority = 0; priority < priority_set_.hostSetsPerPriority().size(); ++priority) {
+      refresh(priority);
+    }
+  });
 }
 
 void EdfLoadBalancerBase::initialize() {
@@ -749,6 +754,7 @@ void EdfLoadBalancerBase::initialize() {
 void EdfLoadBalancerBase::recalculateHostsInSlowStart(const HostVector& hosts_added,
                                                       const HostVector& hosts_removed) {
   for (const auto& host : hosts_added) {
+
     auto host_create_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
         time_source_.monotonicTime() - host->creationTime());
     // Check if host existence time is within slow start window.
@@ -775,6 +781,7 @@ void EdfLoadBalancerBase::recalculateHostsInSlowStart(const HostVector& hosts_ad
       hosts_in_slow_start_.erase(host);
     }
   }
+
   // Compact hosts_in_slow_start_, erase hosts that are outside of slow start window.
   auto current_time =
       std::chrono::time_point_cast<std::chrono::milliseconds>(time_source_.monotonicTime());
@@ -822,7 +829,7 @@ void EdfLoadBalancerBase::refresh(uint32_t priority) {
           time_bias_ = 1.0;
         }
         host_weight *= time_bias_;
-        std::cout << "priority: " << priority << ",host: " << host->hostname()
+        std::cout << "priority: " << priority << ",host: " << host->address()->asString()
                   << ",weight: " << host_weight << std::endl;
       }
 
