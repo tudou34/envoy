@@ -691,6 +691,12 @@ const HostVector& ZoneAwareLoadBalancerBase::hostSourceToHosts(HostsSource hosts
   }
 }
 
+envoy::config::core::v3::RuntimeDouble* newRuntimeDouble() {
+  auto ddd = new (envoy::config::core::v3::RuntimeDouble);
+  ddd->set_default_value(0.3);
+  ddd->set_runtime_key("xxx");
+}
+
 EdfLoadBalancerBase::EdfLoadBalancerBase(
     const PrioritySet& priority_set, const PrioritySet* local_priority_set, ClusterStats& stats,
     Runtime::Loader& runtime, Random::RandomGenerator& random,
@@ -716,12 +722,8 @@ EdfLoadBalancerBase::EdfLoadBalancerBase(
       //                                             runtime)
       //         : nullptr),
       slow_start_window(std::chrono::milliseconds(10) * 1000),
-      // time_bias_runtime_(std::make_unique<Runtime::Double>(0.3,runtime),
+      time_bias_runtime_(std::make_unique<Runtime::Double>(*std::move(newRuntimeDouble()),runtime),
       time_source_(time_source) {
-  auto ddd = new (envoy::config::core::v3::RuntimeDouble);
-  ddd->set_default_value(0.3);
-  ddd->set_runtime_key("xxx");
-  time_bias_runtime_.reset(std::make_unique<Runtime::Double>(*ddd, runtime));
   // We fully recompute the schedulers for a given host set here on membership change, which is
   // consistent with what other LB implementations do (e.g. thread aware).
   // The downside of a full recompute is that time complexity is O(n * log n),
