@@ -721,7 +721,7 @@ EdfLoadBalancerBase::EdfLoadBalancerBase(
   auto ddd = new (envoy::config::core::v3::RuntimeDouble);
   ddd->set_default_value(0.3);
   ddd->set_runtime_key("xxx");
-  time_bias_runtime_ = std::move(std::make_unique<Runtime::Double>(*ddd, runtime));
+  time_bias_runtime_.reset(std::move(std::make_unique<Runtime::Double>(*ddd, runtime)));
   // We fully recompute the schedulers for a given host set here on membership change, which is
   // consistent with what other LB implementations do (e.g. thread aware).
   // The downside of a full recompute is that time complexity is O(n * log n),
